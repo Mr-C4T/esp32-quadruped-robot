@@ -43,18 +43,65 @@
 
                           
 */
+
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
 #define SDA 14
 #define SCL 15
 
-// Buffer pour stocker la commande reçue
-char incomingCommand[250];
+// Command strings are only changed in loop(), never in the ESP-NOW callback.
 String commandString;
 String lastCommand = "";
+
+// T-Deck ESP-NOW protocol (must match the transmitter exactly).
+#define WIFI_CHANNEL 6
+#define PACKET_MAGIC 0x5444
+#define PROTOCOL_VERSION 1
+#define FAILSAFE_MS 500
+
+enum FrameType : uint8_t {
+  FRAME_COMMAND = 1,
+  FRAME_HEARTBEAT = 2
+};
+
+enum RoverCommand : uint8_t {
+  CMD_STOP = 0,
+  CMD_FORWARD = 1,
+  CMD_BACKWARD = 2,
+  CMD_LEFT = 3,
+  CMD_RIGHT = 4,
+  CMD_DANCE = 5,
+  CMD_SQUAT = 6
+};
+
+struct __attribute__((packed)) RoverPacket {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t frameType;
+  uint8_t command;
+  uint8_t reserved;
+  uint16_t sequence;
+};
+
+// Shared between ESP-NOW callback and loop(). 32-bit values are atomic on ESP32.
+volatile int pendingCommand = -1;
+volatile uint32_t lastPacketMs = 0;
+volatile bool linkSeen = false;
+
+// Set when a new command or link timeout interrupts a movement.
+volatile bool abortMotion = false;
+portMUX_TYPE commandMux = portMUX_INITIALIZER_UNLOCKED;
+bool backwardMode = false;
+
+// Last commanded logical positions, used for a gentle STOP recovery.
+int servoPosition[8] = {
+  90, 40, 90, 140, 90, 40, 90, 140
+};
 
 // Définir le GPIO pour la LED
 const int ledPin = 33;
@@ -80,12 +127,47 @@ const int home_joint7 = 140;
 
 bool goMode = false;
 
-// Fonction de callback pour la réception des données
-void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
-    memcpy(incomingCommand, incomingData, len);
-    incomingCommand[len] = '\0';  // Assurer que la chaîne est terminée
-    commandString = String(incomingCommand);
+// ESP-NOW callback: validate and copy only a small command value.
+// Do not use String, Serial, delays, or servo functions in this callback.
+// The signature differs between ESP32 Arduino core 2.x and 3.x.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+#else
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+#endif
+
+    if (len != sizeof(RoverPacket)) {
+        return;
+    }
+
+    RoverPacket packet;
+    memcpy(&packet, incomingData, sizeof(packet));
+
+    if (packet.magic != PACKET_MAGIC ||
+        packet.version != PROTOCOL_VERSION) {
+        return;
+    }
+
+    if (packet.frameType != FRAME_COMMAND &&
+        packet.frameType != FRAME_HEARTBEAT) {
+        return;
+    }
+
+    if (packet.command > CMD_SQUAT) {
+        return;
+    }
+
+    lastPacketMs = millis();
+    linkSeen = true;
+
+    // Only execute commands from command frames.
+    // Heartbeats keep the connection alive.
+    if (packet.frameType == FRAME_COMMAND) {
+        pendingCommand = packet.command;
+        abortMotion = true;
+    }
 }
+
 
 void setup() {
     Serial.begin(115200);
@@ -96,8 +178,14 @@ void setup() {
     pinMode(ledPin, OUTPUT);
     digitalWrite(ledPin, LOW);
 
-    // Mettre l'ESP32 en mode station
+    // Mettre l'ESP32 en mode station and use the T-Deck channel.
     WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    // Print this board's MAC so it can be pasted into the remote's RECEIVER_MAC
+    Serial.print("Rover MAC address: ");
+    Serial.println(WiFi.macAddress());
 
     // Initialiser ESP-NOW
     if (esp_now_init() != ESP_OK) {
@@ -165,30 +253,95 @@ void setup() {
 
 }
 
-// Fonction pour déplacer les servomoteurs vers une position spécifique avec une animation fluide
+// Check for a new command or a lost remote link during long servo routines.
+bool motionMustAbort() {
+    bool shouldAbort;
+    uint32_t now = millis();
+
+    portENTER_CRITICAL(&commandMux);
+
+    if (pendingCommand >= 0) {
+        abortMotion = true;
+    }
+
+    if (linkSeen && (uint32_t)(now - lastPacketMs) > FAILSAFE_MS) {
+        // Queue one STOP and mark the link as timed out.
+        pendingCommand = CMD_STOP;
+        abortMotion = true;
+        linkSeen = false;
+    }
+
+    shouldAbort = abortMotion;
+    portEXIT_CRITICAL(&commandMux);
+
+    return shouldAbort;
+}
+
+// Interruptible replacement for delay() inside movement routines.
+void motionDelay(uint32_t durationMs) {
+    uint32_t started = millis();
+    while ((uint32_t)(millis() - started) < durationMs) {
+        if (motionMustAbort()) return;
+        delay(1);
+    }
+}
+
+// Move one servo. The reverse gait mirrors the four horizontal leg servos
+// around their calibrated home positions; lift servos are unchanged.
 void moveServo(uint8_t servo, int newPos) {
+    if (motionMustAbort()) return;
+
+    if (backwardMode) {
+        switch (servo) {
+            case 0: newPos = 2 * home_joint0 - newPos; break;
+            case 2: newPos = 2 * home_joint2 - newPos; break;
+            case 4: newPos = 2 * home_joint4 - newPos; break;
+            case 6: newPos = 2 * home_joint6 - newPos; break;
+        }
+    }
+
+    newPos = constrain(newPos, 0, 180);
+    servoPosition[servo] = newPos;
     pwm.writeMicroseconds(servo, map(newPos, 0, 180, USMIN, USMAX));
 }
 
 void stopmove() {
+  backwardMode = false;
 
-  if (goMode == true){
-      goMode = false;  // Activer le mode "go"
-         //ANTI-SETUP:
-            for (int i = 45; i > 15 ; i--) {
-              moveServo(0, home_joint0-i);  //back
-              moveServo(6, home_joint6+i);  //front
-              delay(microDelay);
-            }
-            for (int i = 15; i > 0 ; i--) {
-              moveServo(0, home_joint0-i);  //back
-              moveServo(4, home_joint4+i);  //mid-back
-              moveServo(2, home_joint2-i);  //mid-front
-              moveServo(6, home_joint6+i);  //front
-              delay(microDelay);
-            }
-          }
-        }
+  if (goMode) {
+    goMode = false;
+
+    // Original anti-setup recovery from the walking posture.
+    for (int i = 45; i > 15; i--) {
+      moveServo(0, home_joint0-i);
+      moveServo(6, home_joint6+i);
+      motionDelay(microDelay);
+    }
+    for (int i = 15; i > 0; i--) {
+      moveServo(0, home_joint0-i);
+      moveServo(4, home_joint4+i);
+      moveServo(2, home_joint2-i);
+      moveServo(6, home_joint6+i);
+      motionDelay(microDelay);
+    }
+  } else {
+    // A STOP during dance/squat/turn must also recover to the home pose.
+    const int home[8] = {
+      home_joint0, home_joint1, home_joint2, home_joint3,
+      home_joint4, home_joint5, home_joint6, home_joint7
+    };
+    int start[8];
+    for (int s = 0; s < 8; s++) start[s] = servoPosition[s];
+
+    for (int step = 1; step <= 30; step++) {
+      for (int s = 0; s < 8; s++) {
+        int target = start[s] + ((home[s] - start[s]) * step) / 30;
+        moveServo(s, target);
+      }
+      motionDelay(microDelay);
+    }
+  }
+}
         
 // Fonction pour exécuter le mouvement "forward"
 void forward() {
@@ -208,17 +361,17 @@ void forward() {
       moveServo(4, home_joint4+15+i);  //back
       moveServo(2, home_joint2-15+i);  //mid-back
       moveServo(6, home_joint6+45-i);  //mid-front
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 0; i < 60 ; i++) {
       moveServo(0, home_joint0-15+i);  //front
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 30; i > 0 ; i--) {
       moveServo(1,home_joint1+(i*2));  //down
-      delay(microDelay);
+      motionDelay(microDelay);
     }
-    delay(microDelay);
+    motionDelay(microDelay);
     
 //P2:
     for (int i = 0; i < 30 ; i++) {
@@ -227,17 +380,17 @@ void forward() {
       moveServo(4, home_joint4+45-i);  //front
       moveServo(2, home_joint2+15+i);  //back
       moveServo(6, home_joint6+15-i);  //mid-back
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 0; i < 60 ; i++) {
       moveServo(4, home_joint4+15-i);  //front
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 30; i > 0 ; i--) {
       moveServo(5,home_joint5+(i*2));  //down
-      delay(microDelay);    
+      motionDelay(microDelay);    
     }
-    delay(microDelay);
+    motionDelay(microDelay);
 
 
 //P3:
@@ -247,17 +400,17 @@ void forward() {
       moveServo(4, home_joint4-45+i);  //mid-front
       moveServo(2, home_joint2+45-i);  //front
       moveServo(6, home_joint6-15-i);  //back
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 0; i < 60 ; i++) {
       moveServo(2, home_joint2+15-i);  //front
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 30; i > 0 ; i--) {
       moveServo(3,home_joint3-(i*2));  //down
-      delay(microDelay);    
+      motionDelay(microDelay);    
     }
-    delay(microDelay);
+    motionDelay(microDelay);
 
  //P4:
     for (int i = 0; i < 30 ; i++) {
@@ -266,20 +419,48 @@ void forward() {
       moveServo(4, home_joint4-15+i);  //mid-back
       moveServo(2, home_joint2-45+i);  //mid-front
       moveServo(6, home_joint6-45+i);  //front
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 0; i < 60 ; i++) {
       moveServo(6, home_joint6-15+i);  //front
-      delay(microDelay);
+      motionDelay(microDelay);
     }
     for (int i = 30; i > 0 ; i--) {
       moveServo(7,home_joint7-(i*2));  //down
-      delay(microDelay); }
+      motionDelay(microDelay); }
        
-    delay(microDelay); 
+    motionDelay(microDelay); 
     }
 
+// Reverse walking uses the same four-phase gait with mirrored horizontal
+// servo travel. Keep backwardMode enabled for the whole gait cycle.
+void backward() {
+    backwardMode = true;
+    forward();
+}
+
 void loop() {
+    // Transfer the latest ESP-NOW command into the existing command handler.
+    // This is deliberately done here, not inside the ESP-NOW callback.
+    int received = -1;
+    portENTER_CRITICAL(&commandMux);
+    received = pendingCommand;
+    pendingCommand = -1;
+    if (received >= 0) abortMotion = false;
+    portEXIT_CRITICAL(&commandMux);
+
+    if (received >= 0) {
+        switch (received) {
+            case CMD_STOP:     commandString = "stop"; break;
+            case CMD_FORWARD:  commandString = "go"; break;
+            case CMD_BACKWARD: commandString = "backward"; break;
+            case CMD_LEFT:     commandString = "left"; break;
+            case CMD_RIGHT:    commandString = "right"; break;
+            case CMD_DANCE:    commandString = "dance"; break;
+            case CMD_SQUAT:    commandString = "squat"; break;
+        }
+    }
+
     // Vérifier si une nouvelle commande a été reçue
     if (commandString != lastCommand) {
         lastCommand = commandString;
@@ -290,13 +471,13 @@ void loop() {
             stopmove();
             digitalWrite(ledPin, HIGH);
             for (int i = 0; i < 5; i++) {
-                delay(200);
+                motionDelay(200);
                 digitalWrite(ledPin, LOW);
-                delay(200);
+                motionDelay(200);
                 digitalWrite(ledPin, HIGH);
             }
             digitalWrite(ledPin, LOW);
-            delay(microDelay); 
+            motionDelay(microDelay); 
             commandString = "";
             
 
@@ -309,71 +490,71 @@ void loop() {
               moveServo(2,home_joint2+i);
               moveServo(4,home_joint4+i);
               moveServo(6,home_joint6+i);
-              delay(microDelay);
+              motionDelay(microDelay);
             }         
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P1
             for (int i = 0; i < 60 ; i++) {
               moveServo(1,home_joint1+(i));
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(0,home_joint0+i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(1,home_joint1+(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P2: 
             for (int i = 0; i < 60 ; i++) {
               moveServo(5,home_joint5+(i));               
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(4,home_joint4+i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(5,home_joint5+(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P3:
             for (int i = 0; i < 60 ; i++) {
               moveServo(3,home_joint3-(i));   
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(2,home_joint2+i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(3,home_joint3-(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P4:
             for (int i = 0; i < 60 ; i++) {
               moveServo(7,home_joint7-(i)); 
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(6,home_joint6+i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(7,home_joint7-(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
             commandString = "";
 
             } else if (commandString == "left") {     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -385,71 +566,71 @@ void loop() {
               moveServo(2,home_joint2-i);
               moveServo(4,home_joint4-i);
               moveServo(6,home_joint6-i);
-              delay(microDelay);
+              motionDelay(microDelay);
             }         
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P1
             for (int i = 0; i < 60 ; i++) {
               moveServo(1,home_joint1+(i));
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(0,home_joint0-i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(1,home_joint1+(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P2: 
             for (int i = 0; i < 60 ; i++) {
               moveServo(5,home_joint5+(i));               
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(4,home_joint4-i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(5,home_joint5+(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P3:
             for (int i = 0; i < 60 ; i++) {
               moveServo(3,home_joint3-(i));   
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(2,home_joint2-i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(3,home_joint3-(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
 
             //P4:
             for (int i = 0; i < 60 ; i++) {
               moveServo(7,home_joint7-(i)); 
-              delay(microDelay); } //up
+              motionDelay(microDelay); } //up
 
             for (int i = 45; i > 0 ; i--) {
               moveServo(6,home_joint6-i);
-              delay(microDelay);}
+              motionDelay(microDelay);}
 
             for (int i = 60; i > 0 ; i--) {
               moveServo(7,home_joint7-(i)); 
-              delay(microDelay); }
+              motionDelay(microDelay); }
 
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
             commandString = "";
 
             } else if (commandString == "dance") { ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -459,36 +640,36 @@ void loop() {
               moveServo(2,home_joint2+i);
               moveServo(4,home_joint4+i);
               moveServo(6,home_joint6+i);
-              delay(microDelay);
+              motionDelay(microDelay);
             }
-            delay(microDelay);
+            motionDelay(microDelay);
             
             for (int i = 30; i > 0 ; i--) {
               moveServo(0,home_joint0+i);
               moveServo(2,home_joint2+i);
               moveServo(4,home_joint4+i);
               moveServo(6,home_joint6+i);
-              delay(microDelay);
+              motionDelay(microDelay);
             }
-            delay(microDelay); 
+            motionDelay(microDelay); 
             
             for (int i = 0; i < 30 ; i++) {
               moveServo(0,home_joint0-i);
               moveServo(2,home_joint2-i);
               moveServo(4,home_joint4-i);
               moveServo(6,home_joint6-i);
-              delay(microDelay);
+              motionDelay(microDelay);
             }
-            delay(microDelay);
+            motionDelay(microDelay);
             
             for (int i = 30; i > 0 ; i--) {
               moveServo(0,home_joint0-i);
               moveServo(2,home_joint2-i);
               moveServo(4,home_joint4-i);
               moveServo(6,home_joint6-i);
-              delay(microDelay);
+              motionDelay(microDelay);
             }
-            delay(microDelay); 
+            motionDelay(microDelay); 
             commandString = "";
 
             } else if (commandString == "squat") { ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -498,42 +679,65 @@ void loop() {
               moveServo(3,home_joint3-i);  //up
               moveServo(5,home_joint5+i);  //up
               moveServo(1,home_joint1+i);  //up
-              delay(microDelay);
+              motionDelay(microDelay);
             }      
             for (int i = 60; i > 0 ; i--) {
               moveServo(7,home_joint7-i);  //down
               moveServo(3,home_joint3-i);  //down
               moveServo(5,home_joint5+i);  //up
               moveServo(1,home_joint1+i);  //up      
-              delay(microDelay);    
+              motionDelay(microDelay);    
             }  
-            delay(microDelay); 
+            motionDelay(microDelay); 
             commandString = "";          
             
             } else if (commandString == "go") { ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-            goMode = true;  // Activer le mode "go"       
+            stopmove();
+            backwardMode = false;
+            goMode = true;
             //SETUP:
             for (int i = 0; i < 15 ; i++) {
               moveServo(0, home_joint0-i);  //back
               moveServo(4, home_joint4+i);  //mid-back
               moveServo(2, home_joint2-i);  //mid-front
               moveServo(6, home_joint6+i);  //front
-              delay(microDelay);
+              motionDelay(microDelay);
             }
             for (int i = 15; i < 45 ; i++) {
               moveServo(0, home_joint0-i);  //back
               moveServo(6, home_joint6+i);  //front
-              delay(microDelay);
+              motionDelay(microDelay);
             }
           
-            delay(microDelay); 
+            motionDelay(microDelay); 
+            commandString = "";
+
+        } else if (commandString == "backward") {
+            stopmove();
+            backwardMode = true;
+            goMode = true;
+
+            // Start from the same walking posture, mirrored by moveServo().
+            for (int i = 0; i < 15; i++) {
+              moveServo(0, home_joint0-i);
+              moveServo(4, home_joint4+i);
+              moveServo(2, home_joint2-i);
+              moveServo(6, home_joint6+i);
+              motionDelay(microDelay);
+            }
+            for (int i = 15; i < 45; i++) {
+              moveServo(0, home_joint0-i);
+              moveServo(6, home_joint6+i);
+              motionDelay(microDelay);
+            }
             commandString = "";
 
         } else if (commandString == "stop") { ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+            backwardMode = false;
             stopmove();
             digitalWrite(ledPin, LOW);
 
-            delay(microDelay); 
+            motionDelay(microDelay); 
             commandString = "";
 
         }
@@ -542,7 +746,11 @@ void loop() {
     // Exécuter l'action continue si en mode "go"
     if (goMode) {
         digitalWrite(ledPin, HIGH);
-        forward();  // Appel à la fonction forward avec un pas
+        if (backwardMode) {
+            backward();
+        } else {
+            forward();
+        }
         digitalWrite(ledPin, LOW);
     }
-}  
+}
