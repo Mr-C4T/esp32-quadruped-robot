@@ -18,7 +18,7 @@
 
 // Enter your rover receiver ESP32 MAC address here
 uint8_t RECEIVER_MAC[6] = {
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  0xA0, 0xB7, 0x65, 0x6E, 0x44, 0xD0
 };
 
 // =====================================================
